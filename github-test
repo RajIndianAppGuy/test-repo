@@ -1,0 +1,375 @@
+import express from "express";
+import { config } from "dotenv";
+import crypto from "crypto";
+import fs from "fs";
+import jwt from "jsonwebtoken";
+import https from "https";
+import fetch from "node-fetch";
+import { supabase } from "./utils/SupabaseClient.js";
+import {
+  fetchTest,
+  calculateCredits,
+  updateCreditsByCount,
+  fetchUserByEmail,
+  updateTest,
+} from "./supabase/tables.js";
+import axios from "axios";
+
+config();
+
+const APP_ID = process.env.APP_ID;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const PRIVATE_KEY = fs.readFileSync("private-key.pem", "utf8");
+const options = {
+  key: fs.readFileSync("/etc/letsencrypt/live/browsingbee.co/privkey.pem"),
+  cert: fs.readFileSync("/etc/letsencrypt/live/browsingbee.co/fullchain.pem"),
+};
+
+const app = express();
+app.use(express.json({ type: "*/*" }));
+
+function verifySignature(req, res, buf) {
+  const signature = req.headers["x-hub-signature-256"];
+  const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET);
+  const digest = "sha256=" + hmac.update(buf).digest("hex");
+  if (signature !== digest) {
+    throw new Error("Webhook signature verification failed.");
+  }
+}
+
+function createAppJWT() {
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    {
+      iat: now,
+      exp: now + 600,
+      iss: APP_ID,
+    },
+    PRIVATE_KEY,
+    { algorithm: "RS256" }
+  );
+}
+
+async function getInstallationToken(installationId) {
+  const appJWT = createAppJWT();
+  const res = await fetch(
+    `https://api.github.com/app/installations/${installationId}/access_tokens`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${appJWT}`,
+        Accept: "application/vnd.github+json",
+      },
+    }
+  );
+
+  if (!res.ok)
+    throw new Error(`Failed to get installation token: ${res.status}`);
+  const data = await res.json();
+  return data.token;
+}
+
+async function updateCheckRunProgress(
+  { checkRunId, repoFullName, token },
+  title,
+  summary = ""
+) {
+  await fetch(
+    `https://api.github.com/repos/${repoFullName}/check-runs/${checkRunId}`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "BrowsingBee PR Check",
+        status: "in_progress",
+        output: {
+          title,
+          summary,
+        },
+      }),
+    }
+  );
+}
+
+async function runSingleTest(testData, email, associated_workspaceid) {
+  const startTime = new Date();
+  const newRunId = Date.now().toString();
+
+  try {
+    const userData = await fetchUserByEmail(email);
+    const currentCredits = await calculateCredits(
+      userData,
+      `${new Date().getMonth() + 1}-${new Date().getFullYear()}`
+    );
+
+    if (currentCredits <= 0) {
+      throw new Error("Insufficient credits to run test");
+    }
+
+    const selectorSteps = testData.steps;
+
+    const response = await axios.post(
+      `${process.env.DOMAIN_NAME}/run-scenario`,
+      {
+        startUrl: testData.url,
+        steps: selectorSteps,
+        name: testData.name,
+        cache: testData.cache,
+        testId: testData.id,
+        email,
+        runId: newRunId,
+        mobile: testData.mobile,
+      }
+    );
+
+    if (response.data.status === "success") {
+      await updateCreditsByCount(email, 1);
+      await updateTest(testData.id, { latest_run: "Success" });
+
+      return {
+        success: true,
+        data: response.data,
+        runId: newRunId,
+      };
+    } else {
+      throw new Error(response.data.error || "Test failed");
+    }
+  } catch (error) {
+    console.error(
+      `Error running test ${testData.name} (ID: ${testData.id}):`,
+      error.message
+    );
+
+    if (error.response && error.response.data) {
+      await updateTest(testData.id, { latest_run: "Failed" });
+    }
+
+    return {
+      success: false,
+      error: error.message,
+      runId: newRunId,
+      is_temporary_error: !error.response,
+    };
+  }
+}
+
+async function runTests(testIds, email, associated_workspaceid, githubContext) {
+  console.log(`Starting to run tests sequentially: ${testIds.join(", ")}`);
+  const results = [];
+  const statusLog = []; // running summary list for real-time display
+
+  for (let i = 0; i < testIds.length; i++) {
+    const id = testIds[i];
+    const testIndex = i + 1;
+    const totalTests = testIds.length;
+
+    try {
+      const testData = await fetchTest(id);
+
+      if (testData.status !== "active") {
+        const msg = `⚠️ Skipped: ${testData.name} (disabled)`;
+        statusLog.push(`- ⚠️ ${testData.name} *(disabled)*`);
+        results.push({
+          testId: id,
+          success: false,
+          error: msg,
+          name:testData.name
+        });
+
+        if (githubContext) {
+          await updateCheckRunProgress(
+            githubContext,
+            `Progress: ${testIndex}/${totalTests}`,
+            statusLog.join("\n")
+          );
+        }
+
+        continue;
+      }
+
+      // Announce start of test (optional)
+      if (githubContext) {
+        statusLog.push(`- ⏳ ${testData.name} (running)`);
+        await updateCheckRunProgress(
+          githubContext,
+          `Running test ${testIndex}/${totalTests}: ${testData.name}`,
+          statusLog.join("\n")
+        );
+        // Remove ⏳ line after it's shown once
+        statusLog.pop();
+      }
+
+      const result = await runSingleTest(
+        testData,
+        email,
+        associated_workspaceid
+      );
+
+      const statusLine = result.success
+        ? `- ✅ ${testData.name}`
+        : `- ❌ ${testData.name}: ${result.error}`;
+
+      statusLog.push(statusLine);
+      results.push({ testId: id,name:testData.name, ...result });
+
+      if (githubContext) {
+        await updateCheckRunProgress(
+          githubContext,
+          `Progress: ${testIndex}/${totalTests} completed`,
+          statusLog.join("\n")
+        );
+      }
+    } catch (error) {
+      const errorLine = `- ❌ ${id}: Unexpected error - ${error.message}`;
+      statusLog.push(errorLine);
+      const testData = await fetchTest(id);
+
+      results.push({
+        testId: id,
+        success: false,
+        name:testData.name,    
+        error: `Unexpected error: ${error.message}`,
+      });
+
+      if (githubContext) {
+        await updateCheckRunProgress(
+          githubContext,
+          `Error in test ${testIndex}/${totalTests}`,
+          statusLog.join("\n")
+        );
+      }
+    }
+  }
+
+  // Final summary
+  if (githubContext) {
+    const allPassed = results.every((r) => r.success);
+
+    await fetch(
+      `https://api.github.com/repos/${githubContext.repoFullName}/check-runs/${githubContext.checkRunId}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${githubContext.token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "BrowsingBee PR Check",
+          status: "completed",
+          completed_at: new Date().toISOString(),
+          conclusion: allPassed ? "success" : "failure",
+          output: {
+            title: allPassed ? "✅ All tests passed" : "❌ Some tests failed",
+            summary: statusLog.join("\n"), // final display
+          },
+        }),
+      }
+    );
+  }
+
+  return results;
+}
+
+app.post("/github/webhook", async (req, res) => {
+  const event = req.headers["x-github-event"];
+  const payload = req.body;
+
+  console.log(`📩 Received GitHub event: ${event}`);
+
+  if (event === "pull_request" && payload.action === "opened") {
+    const installationId = payload.installation.id;
+    const sha = payload.pull_request.head.sha;
+    const repoFullName = payload.repository.full_name;
+
+    try {
+      const token = await getInstallationToken(installationId);
+
+      // Step 1: Create check run (in_progress)
+      const createRes = await fetch(
+        `https://api.github.com/repos/${repoFullName}/check-runs`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            name: "BrowsingBee PR Check",
+            head_sha: sha,
+            status: "in_progress",
+            started_at: new Date().toISOString(),
+          }),
+        }
+      );
+
+      const checkRun = await createRes.json();
+      const checkRunId = checkRun.id;
+
+      const { data: suiteData, error: suiteError } = await supabase
+        .from("suits")
+        .select("*")
+        .eq("id", 78)
+        .single();
+
+      const results = await runTests(
+        suiteData.testIds,
+        suiteData.email,
+        suiteData.associated_workspaceid,
+        {
+          checkRunId,
+          repoFullName,
+          token,
+        }
+      );
+
+      const allPassed = results.every((r) => r.success);
+
+      // Step 2: Final update to completed
+      await fetch(
+        `https://api.github.com/repos/${repoFullName}/check-runs/${checkRunId}`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            name: "BrowsingBee PR Check",
+            status: "completed",
+            completed_at: new Date().toISOString(),
+            conclusion: allPassed ? "success" : "failure",
+            output: {
+              title: allPassed ? "All tests passed" : "Some tests failed",
+              summary: results
+                .map((r) => {
+                  const link = `https://www.browsingbee.com/test-run/${r.runId}`;
+                  if (r.success) {
+                    return `✅ [${r.testId}-${r.name} - Passed](${link})`;
+                  } else {
+                    return `❌ [${r.testId} - ${r.name} -Failed: ${r.error}](${link})`;
+                  }
+                })
+                .join("\n"),
+            },
+          }),
+        }
+      );
+    } catch (err) {
+      console.error("❌ Error handling PR event:", err.message);
+    }
+  }
+
+  res.status(200).send("OK");
+});
+
+// Create HTTPS server
+https.createServer(options, app).listen(3010, () => {
+  console.log(`Secure server running on port 3010`);
+});
